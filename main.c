@@ -1,8 +1,10 @@
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <pcap.h>
 #include <stdio.h>
+#include <string.h>
 
 /* Ethernet addresses are 6 bytes */
 #define ETHER_ADDR_LEN  6
@@ -74,8 +76,81 @@ struct sniff_tcp {
 /* ethernet headers are always exactly 14 bytes */
 #define SIZE_ETHERNET 14
 
+struct sniff_ipv6 {
+    uint32_t version_class_flow;
+    u_short payload_len;
+    u_char next_header;
+    u_char hop_limit;
+    struct in6_addr src;
+    struct in6_addr dest;
+};
+
+struct sniff_icmp6 {
+    u_char type;
+    u_char code;
+    u_short csum;
+};
+
 bpf_u_int32 mask;       /* Our netmask */
 bpf_u_int32 net;        /* Our IP */
+
+// From https://github.com/regit/nufw/blob/master/src/libs/nubase/ipv6.c
+
+/**
+ * Check if a IPv6 address is a IPv4 or not.
+ *
+ * \return 1 for IPv4 and 0 for IPv6
+ */
+int is_ipv4(const struct in6_addr *addr)
+{
+    if (ntohl(addr->s6_addr32[2]) != 0x0000ffff)
+        return 0;
+    if (addr->s6_addr32[0] != 0 || addr->s6_addr32[1] != 0)
+        return 0;
+    return 1;
+}
+
+
+/**
+ * Format IPv6 address in specified string buffer.
+ * Use IPv4 format ("192.168.0.1") for IPv4 in IPv6 address (::ffff:192.168.0.2).
+ *
+ * If protocol is not NULL, it will contains the address family:
+ * AF_INET (IPv4) or AF_INET6 (IPv6).
+ *
+ * Returns new allocated string.
+ */
+void format_ipv6(const struct in6_addr *addr, char *buffer, size_t buflen, uint8_t *protocol)
+{
+    if (is_ipv4(addr)) {
+        struct in_addr addr4;
+        addr4.s_addr = addr->s6_addr32[3];
+        if (protocol) *protocol = AF_INET;
+        if (inet_ntop(AF_INET, &addr4, buffer, buflen) == NULL)
+        {
+            /* error */
+            strncpy(buffer, "<ipv4>", buflen);
+        }
+    } else {
+        if (protocol) *protocol = AF_INET6;
+        if (inet_ntop(AF_INET6, addr, buffer, buflen) == NULL)
+        {
+            /* error */
+            strncpy(buffer, "<ipv6>", buflen);
+        }
+    }
+    /* always write nul byte at the end */
+    if (0 < buflen) buffer[buflen-1] = 0;
+}
+
+void dump_struct(void* ptr, uint32_t size){
+
+    for(uint32_t i=0; i<size; i++){
+        printf("%02X ", *(((unsigned char*)ptr)+i));
+        if(i % 16 == 15) printf("\n");
+    }
+
+}
 
 void dump_arp(const struct sniff_arp* arp){
     printf("Source MAC: ");
@@ -110,6 +185,8 @@ void dump_arp(const struct sniff_arp* arp){
 void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet){
     const struct sniff_ethernet *ethernet; /* The ethernet header */
     const struct sniff_arp *arp; /* The ARP header */
+    const struct sniff_ipv6 *ipv6; /* The IPv6 header */
+    const struct sniff_icmp6 *icmp6; /* The ICMPv6 header */
 
     u_int size_ip;
     u_int size_tcp;
@@ -140,7 +217,33 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
             dump_arp(arp);
         }
     }else if(ntohs(ethernet->ether_type) == 0x86dd){
-        printf("Got ICMP6 packet\r\n");
+        ipv6 = (struct sniff_ipv6*)(packet + sizeof(struct sniff_ethernet));
+
+        if(ipv6->next_header == 58){
+            unsigned char src_addr[32], dest_addr[32];
+
+            format_ipv6(&(ipv6->src), src_addr, 32, NULL);
+            format_ipv6(&(ipv6->dest), dest_addr, 32, NULL);
+
+            icmp6 = (struct sniff_icmp6*)(packet + sizeof(struct sniff_ipv6) + sizeof(struct sniff_ethernet));
+
+            printf("ICMP6 offset: %d\n", sizeof(struct sniff_ipv6) + sizeof(struct sniff_ethernet));
+            printf("ICMP6 type: %d\n", icmp6->type);
+
+            if(icmp6->type == 133){
+                // Router solicitation
+                printf("Router solicitation from %s\n", src_addr);
+            }else if(icmp6->type == 134){
+                // Router advertisement
+                printf("Router advertisement from %s\n", src_addr);
+            }else if(icmp6->type == 135){
+                // Neighbour solicitation
+                printf("Neighbour solicitation for %s from %s\n", dest_addr, src_addr);
+            }else if(icmp6->type == 136){
+                // Neighbour advertisement
+                printf("Neighbour advertisement for %s from %s\n", src_addr, dest_addr);
+            }
+        }
     }
 }
 
