@@ -1,3 +1,4 @@
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -148,6 +149,17 @@ void format_ipv6(const struct in6_addr *addr, char *buffer, size_t buflen, uint8
     if (0 < buflen) buffer[buflen-1] = 0;
 }
 
+void time_header(void){
+    char buf[64];
+    time_t timer;
+    struct tm* tm_info;
+
+    time(&timer);
+    tm_info = localtime(&timer);
+    strftime(buf, 64, "%F %T", tm_info);
+    printf("[%s] ", buf);
+}
+
 void dump_struct(void* ptr, uint32_t size){
 
     for(uint32_t i=0; i<size; i++){
@@ -219,6 +231,7 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
 
         if((target_addr & mask) != net){
             // Out of subnet ARP
+            time_header();
             printf("WARNING: Out of network ARP packet received\r\n");
             dump_arp(arp);
         }
@@ -235,18 +248,22 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
 
             if(icmp6->type == 133){
                 // Router solicitation
+                time_header();
                 printf("Router solicitation from %s\n", src_addr);
             }else if(icmp6->type == 134){
                 // Router advertisement
+                time_header();
                 printf("Router advertisement from %s\n", src_addr);
             }else if(icmp6->type == 135){
                 // Neighbour solicitation
                 icmp6_ns = (struct sniff_icmp6_ns*)(packet + sizeof(struct sniff_ethernet) + sizeof(struct sniff_ipv6) + sizeof(struct sniff_icmp6));
                 format_ipv6(&(icmp6_ns->target_address), dest_addr, 64, NULL);
+                time_header();
                 printf("Neighbour solicitation for %s from %s\n", dest_addr, src_addr);
 
             }else if(icmp6->type == 136){
                 // Neighbour advertisement
+                time_header();
                 printf("Neighbour advertisement for %s from %s\n", src_addr, dest_addr);
             }
         }
