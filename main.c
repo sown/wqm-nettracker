@@ -91,6 +91,11 @@ struct sniff_icmp6 {
     u_short csum;
 };
 
+struct sniff_icmp6_ns {
+    u_int reserved;
+    struct in6_addr target_address;
+};
+
 bpf_u_int32 mask;       /* Our netmask */
 bpf_u_int32 net;        /* Our IP */
 
@@ -187,6 +192,7 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
     const struct sniff_arp *arp; /* The ARP header */
     const struct sniff_ipv6 *ipv6; /* The IPv6 header */
     const struct sniff_icmp6 *icmp6; /* The ICMPv6 header */
+    const struct sniff_icmp6_ns *icmp6_ns; /* The ICMPv6 Neighbour Solicitation */
 
     u_int size_ip;
     u_int size_tcp;
@@ -220,15 +226,12 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
         ipv6 = (struct sniff_ipv6*)(packet + sizeof(struct sniff_ethernet));
 
         if(ipv6->next_header == 58){
-            unsigned char src_addr[32], dest_addr[32];
+            unsigned char src_addr[64], dest_addr[64];
 
-            format_ipv6(&(ipv6->src), src_addr, 32, NULL);
-            format_ipv6(&(ipv6->dest), dest_addr, 32, NULL);
+            format_ipv6(&(ipv6->src), src_addr, 64, NULL);
+            format_ipv6(&(ipv6->dest), dest_addr, 64, NULL);
 
             icmp6 = (struct sniff_icmp6*)(packet + sizeof(struct sniff_ipv6) + sizeof(struct sniff_ethernet));
-
-            printf("ICMP6 offset: %d\n", sizeof(struct sniff_ipv6) + sizeof(struct sniff_ethernet));
-            printf("ICMP6 type: %d\n", icmp6->type);
 
             if(icmp6->type == 133){
                 // Router solicitation
@@ -238,7 +241,10 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
                 printf("Router advertisement from %s\n", src_addr);
             }else if(icmp6->type == 135){
                 // Neighbour solicitation
+                icmp6_ns = (struct sniff_icmp6_ns*)(packet + sizeof(struct sniff_ethernet) + sizeof(struct sniff_ipv6) + sizeof(struct sniff_icmp6));
+                format_ipv6(&(icmp6_ns->target_address), dest_addr, 64, NULL);
                 printf("Neighbour solicitation for %s from %s\n", dest_addr, src_addr);
+
             }else if(icmp6->type == 136){
                 // Neighbour advertisement
                 printf("Neighbour advertisement for %s from %s\n", src_addr, dest_addr);
