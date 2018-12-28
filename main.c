@@ -5,7 +5,12 @@
 #include <netinet/ip.h>
 #include <pcap.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <ifaddrs.h>
+#include <sys/time.h>
 
 /* Ethernet addresses are 6 bytes */
 #define ETHER_ADDR_LEN  6
@@ -97,8 +102,33 @@ struct sniff_icmp6_ns {
     struct in6_addr target_address;
 };
 
+
+struct wqm_stats {
+    uint32_t arp;
+    uint32_t arp_wrongnet;      // ARP packets seen in the wrong network
+    uint32_t arp_mac_changed;   // ARP packets seen with a different MAC to the last one we saw
+    uint32_t arp_gratuitous;    // ARP packets that are gratuitous (sent to the Broadcast MAC)
+    uint32_t icmp6;             // Total number of ICMPv6 packets seen
+    uint32_t icmp6_ns_wrongnet; // ICMPv6 neighbour solicit packets seen for a network that was not local at program startup
+    uint32_t icmp6_na_wrongnet; // ICMPv6 neighbour advertisement packets seen for a network that was not local at program startup
+    uint32_t icmp6_ra_wrongnet; // ICMPv6 router advertisement packets seen for a network that was not local at program startup
+};
+
+struct wqm_opts {
+    bool human_readable;    // Enable human readable output
+};
+
+struct wqm_stats program_stats;
+struct wqm_opts program_options;
+
+
 bpf_u_int32 mask;       /* Our netmask */
 bpf_u_int32 net;        /* Our IP */
+struct sockaddr_in6 *net6; // Our IPv6 address
+struct sockaddr_in6 *mask6; // Our IPv6 netmask
+
+
+time_t last_stats; // Last stats dump timer
 
 // From https://github.com/regit/nufw/blob/master/src/libs/nubase/ipv6.c
 
@@ -157,7 +187,11 @@ void time_header(void){
     time(&timer);
     tm_info = localtime(&timer);
     strftime(buf, 64, "%F %T", tm_info);
-    printf("[%s] ", buf);
+    if(program_options.human_readable){
+        printf("[%s] ", buf);
+    }else{
+        printf("%s ", buf);
+    }
 }
 
 void dump_struct(void* ptr, uint32_t size){
@@ -167,6 +201,29 @@ void dump_struct(void* ptr, uint32_t size){
         if(i % 16 == 15) printf("\n");
     }
 
+}
+
+int format_mac(char* buffer, uint32_t size, const unsigned char* mac){
+    if(size < 17) return -1; // We can't fit a MAC in this
+    
+    for(uint8_t i=0; i<6; i++){
+        sprintf(buffer+i*3, "%02X", mac[i]);
+        if(i<5) sprintf(buffer+i*3+2, ":");
+    }
+    
+    return 0;
+}
+
+
+int format_ip(char* buffer, uint32_t size, const unsigned char* ip){
+    if(size < 17) return -1; // We can't fit an IP in this
+    
+    for(uint8_t i=0; i<4; i++){
+        sprintf(buffer+i*4, "%03d", ip[i]);
+        if(i<3) sprintf(buffer+i*4+3, ".");
+    }
+    
+    return 0;
 }
 
 void dump_arp(const struct sniff_arp* arp){
@@ -219,7 +276,10 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
     ethernet = (struct sniff_ethernet*)(packet);
 
     if(ntohs(ethernet->ether_type) == 0x0806){     // ARP
+        program_stats.arp++;
         arp = (struct sniff_arp*)(packet + sizeof(struct sniff_ethernet));
+
+        bool gratuitous = 0;
 
         uint32_t target_addr = arp->target_addr[3];
         target_addr = target_addr << 8;
@@ -228,12 +288,44 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
         target_addr += arp->target_addr[1];
         target_addr = target_addr << 8;
         target_addr += arp->target_addr[0];
+        
+        uint32_t source_addr = arp->sender_addr[3];
+        source_addr = source_addr << 8;
+        source_addr += arp->sender_addr[2];
+        source_addr = source_addr << 8;
+        source_addr += arp->sender_addr[1];
+        source_addr = source_addr << 8;
+        source_addr += arp->sender_addr[0];
+
+        if(target_addr == source_addr){
+            gratuitous = 1;
+            program_stats.arp_gratuitous++;
+        }
 
         if((target_addr & mask) != net){
+            program_stats.arp_wrongnet++;
             // Out of subnet ARP
             time_header();
-            printf("WARNING: Out of network ARP packet received\r\n");
-            dump_arp(arp);
+            if(program_options.human_readable){
+                printf("WARNING: Out of network ARP packet received\r\n");
+                dump_arp(arp);
+            }else{
+                char smac[20], dmac[20], sip[18], dip[18];
+                char oos_type[32];
+                
+                if(gratuitous){
+                    sprintf(oos_type, "gratuitous,wrongnet");
+                }else{
+                    sprintf(oos_type, "wrongnet");
+                }
+                
+                format_mac(smac, sizeof(smac), ethernet->ether_shost);
+                format_mac(dmac, sizeof(dmac), ethernet->ether_dhost);
+                format_ip(sip, sizeof(sip), arp->sender_addr);
+                format_ip(dip, sizeof(dip), arp->target_addr);
+                
+                printf("ALERT ARP %s smac=%s dmac=%s sip=%s dip=%s\r\n", oos_type, smac, dmac, sip, dip);
+            }
         }
     }else if(ntohs(ethernet->ether_type) == 0x86dd){
         ipv6 = (struct sniff_ipv6*)(packet + sizeof(struct sniff_ethernet));
@@ -270,6 +362,21 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
     }
 }
 
+void stats_dumper(void){
+    time_header();
+    printf("STAT arp=%d arp_wrongnet=%d arp_mac_changed=%d arp_gratuitous=%d icmp6=%d icmp6_ns_wrongnet=%d icmp6_na_wrongnet=%d icmp6_ra_wrongnet=%d\r\n",
+        program_stats.arp,
+        program_stats.arp_wrongnet,
+        program_stats.arp_mac_changed,
+        program_stats.arp_gratuitous,
+        program_stats.icmp6,
+        program_stats.icmp6_ns_wrongnet,
+        program_stats.icmp6_na_wrongnet,
+        program_stats.icmp6_ra_wrongnet
+    );
+    memset(&program_stats, 0, sizeof(struct wqm_stats));
+}
+
  int main(int argc, char *argv[])
  {
     pcap_t *handle;         /* Session handle */
@@ -279,6 +386,26 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
     char filter_exp[] = "arp or icmp6"; // or ( icmp6 && (ip6[40] >= 133 && ip6[40] <= 136 ) ) ";  /* The filter expression */
     struct pcap_pkthdr header;  /* The header that pcap gives us */
     const u_char *packet;       /* The actual packet */
+    struct ifaddrs *ifa, *ifa_tmp;
+    struct itimerval initial, updated;
+    
+    // Stats timer functions
+    struct sigaction sa;
+    struct itimerval stats_timer;
+    
+    // Hook onto SIGALARM
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = &stats_dumper;
+    sigaction(SIGALRM, &sa, NULL);
+    
+    // Set a 60 second timer
+    stats_timer.it_value.tv_sec = 60;
+    stats_timer.it_value.tv_usec = 0;
+    /* ... and every 250 msec after that. */
+    stats_timer.it_interval.tv_sec = 60;
+    stats_timer.it_interval.tv_usec = 0;
+    setitimer (ITIMER_REAL, &stats_timer, NULL);
+
 
     /* Define the device */
     if(argc > 1){
@@ -294,6 +421,7 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
             fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
             return(2);
         }
+        dev = argv[1];
     }else{
         dev = pcap_lookupdev(errbuf);
         if (dev == NULL) {
@@ -314,7 +442,30 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
         }
     }
 
-    printf("My network: %d.%d.%d.%d / %d.%d.%d.%d\r\n", 
+    if (getifaddrs(&ifa) == -1) {
+        fprintf(stderr, "getifaddrs failed\n");
+        return 2;
+    }
+
+    ifa_tmp = ifa;
+    while (ifa_tmp) {
+        if( (strcmp(ifa_tmp->ifa_name, dev) == 0) &&
+            (ifa_tmp->ifa_addr) && 
+            (ifa_tmp->ifa_addr->sa_family == AF_INET6) ) {
+                // create IPv6 string
+                net6 = (struct sockaddr_in6*) (ifa_tmp->ifa_addr);
+                if((((uint16_t)net6) & 0xfe80) != 0xfe80){
+                    mask6 = (struct sockaddr_in6*) ifa_tmp->ifa_netmask;
+                    for(uint8_t i = 0; i < 16; i++)
+                        net6->sin6_addr.s6_addr[i] &= mask6->sin6_addr.s6_addr[i];
+                    break;
+                }
+        }
+        ifa_tmp = ifa_tmp->ifa_next;
+    }
+
+    #ifdef DEBUG
+    printf("My network (IPv4): %d.%d.%d.%d / %d.%d.%d.%d\r\n", 
         (net >>  0) & 0xFF,
         (net >>  8) & 0xFF,
         (net >> 16) & 0xFF,
@@ -324,6 +475,13 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
         (mask >> 16) & 0xFF,
         (mask >> 24) & 0xFF
         );
+        
+    char v6print1[64], v6print2[64];
+    inet_ntop(AF_INET6, &net6->sin6_addr, v6print1, sizeof(v6print1));
+    inet_ntop(AF_INET6, &mask6->sin6_addr, v6print2, sizeof(v6print2));
+    printf("My network (IPv6): %s / %s\r\n", v6print1, v6print2);
+    #endif
+    
     /* Compile and apply the filter */
     if (pcap_compile(handle, &fp, filter_exp, 0, net) == -1) {
         fprintf(stderr, "Couldn't parse filter %s: %s\n", filter_exp, pcap_geterr(handle));

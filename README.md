@@ -19,6 +19,9 @@ either human (-H) or machine readable (default) format.
 By default, it reports over ARP traffic and ICMPv6 traffic.
 
 ## Output format
+
+All output lines are prepended with a date and timestamp (in square brackets for human readable, and without the brackets for computer readable).
+
 Approximately once a minute, NetTracker will output a Statistics line (machine
 format) or Statistics report (human format).
 
@@ -32,7 +35,6 @@ Valid keys are:
  - arp\_wrongnet (Number of ARP packets seen in the wrong network)
  - arp\_mac\_changed (Number of ARP packets seen with a changed MAC address)
  - arp\_gratuitous (Number of gratuitous ARP packets seen)
- - arp\_gratuitious\_wrongnet (Number of gratuitous ARPs seen in the wrong net)
  - icmp6 (Total number of ICMPv6 packets seen)
  - icmp6\_ns\_wrongnet (Neighbour solicitations seen in the wrong subnet)
  - icmp6\_na\_wrongnet (Neighbour advertisements seen in the wrong subnet)
