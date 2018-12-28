@@ -331,6 +331,8 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
         ipv6 = (struct sniff_ipv6*)(packet + sizeof(struct sniff_ethernet));
 
         if(ipv6->next_header == 58){
+            program_stats.icmp6++;
+            
             unsigned char src_addr[64], dest_addr[64];
 
             format_ipv6(&(ipv6->src), src_addr, 64, NULL);
