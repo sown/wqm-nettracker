@@ -343,16 +343,18 @@ int free_icmp6_options(struct icmp6_option_list* options){
     }
 }
 
-unsigned __int128 in6_to_int128(struct in6_addr* addr){
-    unsigned __int128 r = 0;
-    for(uint8_t n = 0; n<16; n++)
-        r += (addr->s6_addr[n] << 8*n);
-    return r;
-}
-
-void int128_to_in6(struct in6_addr* target, unsigned __int128 addr){
-    for(uint8_t n = 0; n<16; n++)
-        target->s6_addr[n] = (unsigned char) (addr >> 8*n) & 0xFF;
+// From https://stackoverflow.com/questions/37786946/how-to-compare-ipv6-address-in-c-without-using-memcmp
+int compare_ipv6(struct in6_addr *ipA, struct in6_addr *ipB)
+{
+    int i = 0;
+    for(i = 0; i < 16; ++i) // Don't use magic number, here just for example
+    {
+        if (ipA->s6_addr[i] < ipB->s6_addr[i])
+            return -1;
+        else if (ipA->s6_addr[i] > ipB->s6_addr[i])
+            return 1;
+    }
+    return 0;
 }
 
 void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet){
@@ -475,8 +477,8 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
                         // Prefix information option
                         const struct icmp6_ra_opt_prefix *prefix = (struct icmp6_ra_opt_prefix*) ( icmp6_options->data );
                         if(
-                            (in6_to_int128(&prefix->prefix) != in6_to_int128(&net6->sin6_addr)) || 
-                            ( (prefix->prefix_length != mask6_prefix_bits) && (in6_to_int128(&prefix->prefix) == in6_to_int128(&net6->sin6_addr)) )
+                            (compare_ipv6(&prefix->prefix, &net6->sin6_addr) != 0) || 
+                            ( (prefix->prefix_length != mask6_prefix_bits) && (compare_ipv6(&prefix->prefix, &net6->sin6_addr) == 0) )
                           ){
                             program_stats.icmp6_ra_wrongnet++;
                             // Wrong network
