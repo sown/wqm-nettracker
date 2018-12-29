@@ -123,12 +123,13 @@ struct sniff_icmp6_option {
 };
 
 struct icmp6_ra_opt_prefix {
-    struct sniff_icmp6_option opt_hdr;
-    u_char prefix_length;
-    u_char flags;
-    u_int valid_lifetime;
-    u_int preferred_lifetime;
-    u_int reserved;
+    uint8_t type;
+    uint8_t length;
+    uint8_t prefix_length;
+    uint8_t flags;
+    uint32_t valid_lifetime;
+    uint32_t preferred_lifetime;
+    uint32_t reserved2;
     struct in6_addr prefix;
 };
 
@@ -463,7 +464,6 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
                 icmp6_options = process_icmp6_options((void*)(packet + sizeof(struct sniff_ethernet) + sizeof(struct sniff_ipv6) + sizeof(struct sniff_icmp6) + sizeof(struct sniff_icmp6_ra)),
                                                       payload_len - sizeof(struct sniff_icmp6) - sizeof(struct sniff_icmp6_ra));
                 
-                time_header();
                 #ifdef DEBUG
                 printf("Router advertisement from %s\n", src_addr);
                 printf("ICMP6 options: %p\n", icmp6_options);
@@ -485,8 +485,10 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
                             char prefix_formatted[128];
                             inet_ntop(AF_INET6, &prefix->prefix, prefix_formatted, sizeof(prefix_formatted));
                             if(program_options.human_readable){
+                                time_header();
                                 printf("ALERT ICMPv6 RA for incorrect subnet received from %s (Subnet: %s/%d)\n", smac, prefix_formatted, prefix->prefix_length);
                             }else{
+                                time_header();
                                 printf("ALERT ICMPv6 ra_wrongnet smac=%s dmac=%s icmp6_sip=%s icmp6_dip=%s icmp6_ra_prefix=%s/%d\n", smac, dmac, src_addr, dest_addr, prefix_formatted, prefix->prefix_length);
                             }
                         }
