@@ -622,6 +622,9 @@ void stats_dumper(void){
     }
 
     #ifdef DEBUG
+    printf("sizeof(struct sniff_ipv6): %d\n", sizeof(struct sniff_ipv6));
+    printf("sizeof(struct sniff_icmp6): %d\n", sizeof(struct sniff_icmp6));
+    printf("sizeof(struct sniff_icmp6_ra): %d\n", sizeof(struct sniff_icmp6_ra));
     printf("My network (IPv4): %d.%d.%d.%d / %d.%d.%d.%d\r\n", 
         (net >>  0) & 0xFF,
         (net >>  8) & 0xFF,
