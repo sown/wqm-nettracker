@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -83,7 +84,7 @@ struct sniff_tcp {
 #define SIZE_ETHERNET 14
 
 struct sniff_ipv6 {
-    uint32_t version_class_flow;
+    u_int version_class_flow;
     u_short payload_len;
     u_char next_header;
     u_char hop_limit;
@@ -95,13 +96,47 @@ struct sniff_icmp6 {
     u_char type;
     u_char code;
     u_short csum;
+    union
+    {
+        uint32_t  icmp6_un_data32[1]; /* type-specific field */
+        uint16_t  icmp6_un_data16[2]; /* type-specific field */
+        uint8_t   icmp6_un_data8[4];  /* type-specific field */
+    } icmp6_dataun;
 };
 
 struct sniff_icmp6_ns {
-    u_int reserved;
     struct in6_addr target_address;
 };
 
+struct sniff_icmp6_na {
+    struct in6_addr target_address;
+};
+
+struct sniff_icmp6_ra {
+    u_int reachable;
+    u_int retransmit;
+};
+
+struct sniff_icmp6_option {
+    u_char type;
+    u_char length;
+};
+
+struct icmp6_ra_opt_prefix {
+    struct sniff_icmp6_option opt_hdr;
+    u_char prefix_length;
+    u_char flags;
+    u_int valid_lifetime;
+    u_int preferred_lifetime;
+    u_int reserved;
+    struct in6_addr prefix;
+};
+
+struct icmp6_option_list {
+    struct sniff_icmp6_option *option;
+    void* data;
+    struct icmp6_option_list *next;
+};
 
 struct wqm_stats {
     uint32_t arp;
@@ -126,6 +161,7 @@ bpf_u_int32 mask;       /* Our netmask */
 bpf_u_int32 net;        /* Our IP */
 struct sockaddr_in6 *net6; // Our IPv6 address
 struct sockaddr_in6 *mask6; // Our IPv6 netmask
+u_char mask6_prefix_bits;
 
 
 time_t last_stats; // Last stats dump timer
@@ -256,15 +292,81 @@ void dump_arp(const struct sniff_arp* arp){
     printf("\r\n");
 }
 
+// Generate a linked list of options from an arbitrary data stream
+struct icmp6_option_list* process_icmp6_options(void* opt_start, u_short max_length){
+    struct icmp6_option_list* head;
+    struct icmp6_option_list* cur;
+    struct icmp6_option_list* last;
+    #ifdef DEBUG
+    printf("process_icmp6_options(<ptr>, %p, %d)\n", opt_start, max_length);
+    #endif
+    
+    if(max_length == 0){
+        return NULL;
+    }
+    
+    void *ptr_start = opt_start;
+    head = NULL;
+    last = NULL;
+    
+    struct sniff_icmp6_option* tmp_opt;
+    
+    while(max_length > sizeof(struct sniff_icmp6_option)){
+        tmp_opt = (struct sniff_icmp6_option*)ptr_start;
+        cur = malloc( sizeof(struct icmp6_option_list) );
+        cur->option = tmp_opt;
+        cur->next = NULL;
+        cur->data = opt_start;
+        #ifdef DEBUG
+        printf("Added IPv6 Option %d (Length: %d) from %p\n", cur->option->type, cur->option->length, ptr_start);
+        #endif
+        if(last != NULL) last->next = cur;
+        last = cur;
+        if(head == NULL) head = cur;
+        max_length -= tmp_opt->length * 8;
+        ptr_start += tmp_opt->length * 8;
+    }
+    
+    return head;
+}
+
+int free_icmp6_options(struct icmp6_option_list* options){
+    struct icmp6_option_list* tmp;
+    struct icmp6_option_list* cur;
+    
+    tmp = options;
+    
+    while(tmp){
+        cur = tmp;
+        tmp = tmp->next;
+        free(cur);
+    }
+}
+
+unsigned __int128 in6_to_int128(struct in6_addr* addr){
+    unsigned __int128 r = 0;
+    for(uint8_t n = 0; n<16; n++)
+        r += (addr->s6_addr[n] << 8*n);
+    return r;
+}
+
+void int128_to_in6(struct in6_addr* target, unsigned __int128 addr){
+    for(uint8_t n = 0; n<16; n++)
+        target->s6_addr[n] = (unsigned char) (addr >> 8*n) & 0xFF;
+}
+
 void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet){
     const struct sniff_ethernet *ethernet; /* The ethernet header */
     const struct sniff_arp *arp; /* The ARP header */
     const struct sniff_ipv6 *ipv6; /* The IPv6 header */
     const struct sniff_icmp6 *icmp6; /* The ICMPv6 header */
+    const struct sniff_icmp6_na *icmp6_na; /* The ICMPv6 Neighbour Advertisement */
     const struct sniff_icmp6_ns *icmp6_ns; /* The ICMPv6 Neighbour Solicitation */
-
+    const struct sniff_icmp6_ra *icmp6_ra; /* The ICMPv6 Router Advertisement */
+    struct icmp6_option_list *icmp6_options; /* The ICMPv6 options - TLV format */
     u_int size_ip;
     u_int size_tcp;
+    char smac[20], dmac[20];
 
     /*for(uint16_t i = 0; i<64; i++){
         printf("%02X ", packet[i]);
@@ -274,7 +376,9 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
     }*/
 
     ethernet = (struct sniff_ethernet*)(packet);
-
+    format_mac(smac, sizeof(smac), ethernet->ether_shost);
+    format_mac(dmac, sizeof(dmac), ethernet->ether_dhost);
+    
     if(ntohs(ethernet->ether_type) == 0x0806){     // ARP
         program_stats.arp++;
         arp = (struct sniff_arp*)(packet + sizeof(struct sniff_ethernet));
@@ -310,7 +414,7 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
                 printf("WARNING: Out of network ARP packet received\r\n");
                 dump_arp(arp);
             }else{
-                char smac[20], dmac[20], sip[18], dip[18];
+                char sip[18], dip[18], arpsmac[20], arpdmac[20];
                 char oos_type[32];
                 
                 if(gratuitous){
@@ -319,18 +423,24 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
                     sprintf(oos_type, "wrongnet");
                 }
                 
-                format_mac(smac, sizeof(smac), ethernet->ether_shost);
-                format_mac(dmac, sizeof(dmac), ethernet->ether_dhost);
                 format_ip(sip, sizeof(sip), arp->sender_addr);
                 format_ip(dip, sizeof(dip), arp->target_addr);
+                format_mac(arpsmac, sizeof(arpsmac), arp->sender_mac);
+                format_mac(arpdmac, sizeof(arpdmac), arp->target_mac);
                 
-                printf("ALERT ARP %s smac=%s dmac=%s sip=%s dip=%s\r\n", oos_type, smac, dmac, sip, dip);
+                printf("ALERT ARP %s smac=%s dmac=%s arp_sip=%s arp_dip=%s arp_smac=%s arp_dmac=%s\r\n", oos_type, smac, dmac, sip, dip, arpsmac, arpdmac);
             }
         }
     }else if(ntohs(ethernet->ether_type) == 0x86dd){
         ipv6 = (struct sniff_ipv6*)(packet + sizeof(struct sniff_ethernet));
 
+        uint16_t payload_len = ((ipv6->payload_len & 0xFF00) >> 8) + ((ipv6->payload_len & 0x00FF) << 8);
+
         if(ipv6->next_header == 58){
+            #ifdef DEBUG
+            printf("Packet ptr: %p\n", packet);
+            #endif
+            
             program_stats.icmp6++;
             
             unsigned char src_addr[64], dest_addr[64];
@@ -346,8 +456,43 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
                 printf("Router solicitation from %s\n", src_addr);
             }else if(icmp6->type == 134){
                 // Router advertisement
+                icmp6_ra = (struct sniff_icmp6_ra*)(packet + sizeof(struct sniff_ethernet) + sizeof(struct sniff_ipv6) + sizeof(struct sniff_icmp6));
+                // Parse options to get prefix
+                icmp6_options = process_icmp6_options((void*)(packet + sizeof(struct sniff_ethernet) + sizeof(struct sniff_ipv6) + sizeof(struct sniff_icmp6) + sizeof(struct sniff_icmp6_ra)),
+                                                      payload_len - sizeof(struct sniff_icmp6) - sizeof(struct sniff_icmp6_ra));
+                
                 time_header();
+                #ifdef DEBUG
                 printf("Router advertisement from %s\n", src_addr);
+                printf("ICMP6 options: %p\n", icmp6_options);
+                #endif
+                while(icmp6_options){
+                    #ifdef DEBUG
+                    printf("Option: %d, Len %d\n", icmp6_options->option->type, icmp6_options->option->length);
+                    #endif
+                    
+                    if(icmp6_options->option->type == 3){
+                        // Prefix information option
+                        const struct icmp6_ra_opt_prefix *prefix = (struct icmp6_ra_opt_prefix*) ( icmp6_options->data );
+                        if(
+                            (in6_to_int128(&prefix->prefix) != in6_to_int128(&net6->sin6_addr)) || 
+                            ( (prefix->prefix_length != mask6_prefix_bits) && (in6_to_int128(&prefix->prefix) == in6_to_int128(&net6->sin6_addr)) )
+                          ){
+                            program_stats.icmp6_ra_wrongnet++;
+                            // Wrong network
+                            char prefix_formatted[128];
+                            inet_ntop(AF_INET6, &prefix->prefix, prefix_formatted, sizeof(prefix_formatted));
+                            if(program_options.human_readable){
+                                printf("ALERT ICMPv6 RA for incorrect subnet received from %s (Subnet: %s/%d)\n", smac, prefix_formatted, prefix->prefix_length);
+                            }else{
+                                printf("ALERT ICMPv6 ra_wrongnet smac=%s dmac=%s icmp6_sip=%s icmp6_dip=%s icmp6_ra_prefix=%s/%d\n", smac, dmac, src_addr, dest_addr, prefix_formatted, prefix->prefix_length);
+                            }
+                        }
+                    }
+                    
+                    icmp6_options = icmp6_options->next;
+                }
+                free_icmp6_options(icmp6_options);
             }else if(icmp6->type == 135){
                 // Neighbour solicitation
                 icmp6_ns = (struct sniff_icmp6_ns*)(packet + sizeof(struct sniff_ethernet) + sizeof(struct sniff_ipv6) + sizeof(struct sniff_icmp6));
@@ -357,6 +502,8 @@ void process_packet(u_char *args, const struct pcap_pkthdr *header, const u_char
 
             }else if(icmp6->type == 136){
                 // Neighbour advertisement
+                icmp6_na = (struct sniff_icmp6_na*)(packet + sizeof(struct sniff_ethernet) + sizeof(struct sniff_ipv6) + sizeof(struct sniff_icmp6));
+                format_ipv6(&(icmp6_na->target_address), dest_addr, 64, NULL);
                 time_header();
                 printf("Neighbour advertisement for %s from %s\n", src_addr, dest_addr);
             }
@@ -460,6 +607,10 @@ void stats_dumper(void){
                     mask6 = (struct sockaddr_in6*) ifa_tmp->ifa_netmask;
                     for(uint8_t i = 0; i < 16; i++)
                         net6->sin6_addr.s6_addr[i] &= mask6->sin6_addr.s6_addr[i];
+                    mask6_prefix_bits = 0;
+                    for(uint8_t i = 0; i < 16; i++)
+                        for(uint8_t j = 0; j < 8; j++)
+                            mask6_prefix_bits += (mask6->sin6_addr.s6_addr[i] >> j) & 0x01;
                     break;
                 }
         }
@@ -481,7 +632,7 @@ void stats_dumper(void){
     char v6print1[64], v6print2[64];
     inet_ntop(AF_INET6, &net6->sin6_addr, v6print1, sizeof(v6print1));
     inet_ntop(AF_INET6, &mask6->sin6_addr, v6print2, sizeof(v6print2));
-    printf("My network (IPv6): %s / %s\r\n", v6print1, v6print2);
+    printf("My network (IPv6): %s / %d\r\n", v6print1, mask6_prefix_bits);
     #endif
     
     /* Compile and apply the filter */
