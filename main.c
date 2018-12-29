@@ -317,7 +317,7 @@ struct icmp6_option_list* process_icmp6_options(void* opt_start, u_short max_len
         cur = malloc( sizeof(struct icmp6_option_list) );
         cur->option = tmp_opt;
         cur->next = NULL;
-        cur->data = opt_start;
+        cur->data = ptr_start;
         #ifdef DEBUG
         printf("Added IPv6 Option %d (Length: %d) from %p\n", cur->option->type, cur->option->length, ptr_start);
         #endif
